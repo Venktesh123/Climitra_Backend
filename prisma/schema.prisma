@@ -1,0 +1,78 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  FIELD_AGENT
+  REVIEWER
+  ADMIN
+}
+
+enum CaptureStatus {
+  QUEUED
+  PROCESSING
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  OCR_FAILED
+}
+
+enum ActorType {
+  HUMAN
+  SYSTEM
+}
+
+model User {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  password  String
+  role      Role     @default(FIELD_AGENT)
+  createdAt DateTime @default(now())
+
+  captures  Capture[]
+}
+
+model Capture {
+  id              String        @id @default(cuid())
+  documentType    String
+  status          CaptureStatus @default(QUEUED)
+  blobUrl         String
+  uploadedById    String
+  uploadedAt      DateTime      @default(now())
+
+  uploadedBy      User             @relation(fields: [uploadedById], references: [id])
+  extractedFields ExtractedField[]
+  auditEvents     AuditEvent[]
+}
+
+model ExtractedField {
+  id              String   @id @default(cuid())
+  captureId       String
+  fieldName       String
+  value           String
+  confidenceScore Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  capture         Capture  @relation(fields: [captureId], references: [id])
+}
+
+model AuditEvent {
+  id         String    @id @default(cuid())
+  captureId  String
+  eventType  String
+  fieldName  String?
+  oldValue   String?
+  newValue   String?
+  actorId    String
+  actorType  ActorType
+  createdAt  DateTime  @default(now())
+
+  capture    Capture   @relation(fields: [captureId], references: [id])
+}
