@@ -1,12 +1,16 @@
 {
   "name": "climitra-backend",
   "version": "1.0.0",
+
   "main": "src/server.js",
+
   "scripts": {
-  "dev": "nodemon src/server.js",
-  "start": "node src/server.js",
-  "build": "prisma generate"
-},
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "build": "prisma generate",
+    "postinstall": "prisma generate"
+  },
+
   "dependencies": {
     "@prisma/client": "^5.0.0",
     "@vercel/blob": "^2.4.0",
@@ -24,6 +28,7 @@
     "tesseract.js": "^5.0.4",
     "zod": "^3.22.4"
   },
+
   "devDependencies": {
     "nodemon": "^3.0.1",
     "prisma": "^5.0.0"
