@@ -10,49 +10,41 @@ const FIELD_RULES = {
   WEIGHBRIDGE: [
     {
       label: 'gross_weight',
-      // Matches: "Gross Weight  35000" or "Gross Wt: 35000" or "Gross  35,000"
       pattern: /gross\s*(?:weight|wt)?\s*[:\-]?\s*([\d,\.]+)/i,
       validate: (v) => parseFloat(v.replace(/,/g, '')) > 0
     },
     {
       label: 'tare_weight',
-      // Matches: "Tare Weight  15000" or "Tare Wt: 15000"
       pattern: /tare\s*(?:weight|wt)?\s*[:\-]?\s*([\d,\.]+)/i,
       validate: (v) => parseFloat(v.replace(/,/g, '')) > 0
     },
     {
       label: 'net_weight',
-      // Matches: "Nett Weight  20000" or "Net Weight: 20000"
       pattern: /n[ae]tt?\s*(?:weight|wt)?\s*[:\-]?\s*([\d,\.]+)/i,
       validate: (v) => parseFloat(v.replace(/,/g, '')) > 0
     },
     {
       label: 'vehicle_number',
-      // Matches: "Vehicle Reg: YD16WMD" or "Veh No: GJ05AB1234"
       pattern: /vehicle\s*(?:reg|no|number|registration)?\s*[:\-]?\s*([A-Z0-9]{5,10})/i,
       validate: (v) => v.replace(/[\s\-]/g, '').length >= 5
     },
     {
       label: 'ticket_number',
-      // Matches: "Ticket No  2000181"
       pattern: /ticket\s*(?:no|number|#)?\s*[:\-]?\s*(\w+)/i,
       validate: null
     },
     {
       label: 'date',
-      // Matches: "27/06/2019" or "27-06-2019" or "Date  27/06/2019"
       pattern: /(?:date\s*[:\-]?\s*)?(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
       validate: (v) => !isNaN(Date.parse(v.replace(/\./g, '/')))
     },
     {
       label: 'customer',
-      // Matches: "Customer O/N  A004"
       pattern: /customer\s*(?:o\/n|no|number|name)?\s*[:\-]?\s*([A-Z0-9]+)/i,
       validate: null
     },
     {
       label: 'transaction_type',
-      // Matches: "Transaction Type  INWARD"
       pattern: /transaction\s*(?:type)?\s*[:\-]?\s*([A-Z]+)/i,
       validate: null
     }
@@ -113,6 +105,16 @@ const FIELD_RULES = {
       validate: null
     }
   ]
+};
+
+// ─── BLANK / UNREADABLE IMAGE DETECTION ─────────────────────────────────────
+const isBlankOrUnreadable = (ocrResult) => {
+  const { data } = ocrResult;
+  const text = (data.text || '').trim();
+  const confidence = data.confidence || 0;
+
+  // Blank if nothing extracted or confidence too low to be useful
+  return text.length === 0 || confidence < 20;
 };
 
 // ─── CONFIDENCE SCORING ──────────────────────────────────────────────────────
@@ -186,8 +188,18 @@ const processJob = async (job) => {
     where: { id: captureId }
   });
 
+  // Capture not found in DB — ack and bail immediately
   if (!capture) {
     console.error(`[OCR Worker] Capture not found: ${captureId}`);
+    await queueService.ackJob(job);
+    return;
+  }
+
+  // Guard: skip anything already past QUEUED to prevent reprocessing
+  // This handles the case where the same job is delivered twice by the queue
+  if (capture.status !== 'QUEUED') {
+    console.warn(`[OCR Worker] Skipping ${captureId} — status is already "${capture.status}"`);
+    await queueService.ackJob(job);
     return;
   }
 
@@ -198,8 +210,10 @@ const processJob = async (job) => {
 
   try {
     // Download image from Vercel Blob
+    // timeout: 15s guards against hanging on blank/corrupt blob URLs
     const imageResponse = await axios.get(capture.blobUrl, {
-      responseType: 'arraybuffer'
+      responseType: 'arraybuffer',
+      timeout: 15000,
     });
     const imageBuffer = Buffer.from(imageResponse.data);
 
@@ -208,15 +222,55 @@ const processJob = async (job) => {
       tessedit_pageseg_mode: '6',
     });
 
+    const pageConfidence = Math.round(ocrResult.data.confidence);
+    const rules = FIELD_RULES[capture.documentType] || FIELD_RULES.WEIGHBRIDGE;
+
+    // ── CASE 1: Blank or completely unreadable image ─────────────────────────
+    // e.g. dark photo, upside down, corrupted upload
+    if (isBlankOrUnreadable(ocrResult)) {
+      console.warn(`[OCR Worker] Blank/unreadable image for capture: ${captureId}`);
+
+      // Still write all expected fields as empty so reviewer sees full structure
+      await prisma.extractedField.deleteMany({ where: { captureId } });
+      await prisma.extractedField.createMany({
+        data: rules.map((rule) => ({
+          captureId,
+          fieldName: rule.label,
+          value: '',
+          confidenceScore: 0
+        }))
+      });
+
+      await prisma.capture.update({
+        where: { id: captureId },
+        data: { status: 'OCR_FAILED' }
+      });
+
+      await auditService.createAuditLog({
+        captureId,
+        eventType: 'OCR_FAILED',
+        actorId: 'SYSTEM',
+        actorType: 'SYSTEM',
+        fieldName: null,
+        oldValue: null,
+        newValue: `Blank or unreadable image (confidence: ${pageConfidence}%)`
+      });
+
+      console.warn(`[OCR Worker] Marked as OCR_FAILED (blank): ${captureId}`);
+      return; // falls through to finally → ackJob
+    }
+
     // Extract structured fields
     const fields = extractFields(ocrResult, capture.documentType);
 
-    // Delete any existing fields for this capture (in case of retry)
-    await prisma.extractedField.deleteMany({
-      where: { captureId }
-    });
+    const matchedCount = fields.filter((f) => f.value !== '').length;
+    const totalCount = fields.length;
+    const matchRatio = matchedCount / totalCount;
 
-    // Save extracted fields to DB
+    console.log(`[OCR Worker] Matched ${matchedCount}/${totalCount} fields (ratio: ${matchRatio.toFixed(2)})`);
+
+    // Always save whatever was extracted — even partial or empty
+    await prisma.extractedField.deleteMany({ where: { captureId } });
     await prisma.extractedField.createMany({
       data: fields.map((f) => ({
         captureId,
@@ -226,13 +280,37 @@ const processJob = async (job) => {
       }))
     });
 
-    // Mark as PENDING_REVIEW
+    // ── CASE 2: Valid image but wrong document / missing data ─────────────────
+    // e.g. AC unit photo uploaded as WEIGHBRIDGE — like in the screenshot
+    // Threshold: less than 30% of expected fields matched
+    if (matchRatio < 0.3) {
+      console.warn(`[OCR Worker] Too few fields matched for capture: ${captureId}`);
+
+      await prisma.capture.update({
+        where: { id: captureId },
+        data: { status: 'OCR_FAILED' }
+      });
+
+      await auditService.createAuditLog({
+        captureId,
+        eventType: 'OCR_FAILED',
+        actorId: 'SYSTEM',
+        actorType: 'SYSTEM',
+        fieldName: null,
+        oldValue: null,
+        newValue: `Only ${matchedCount}/${totalCount} fields matched — wrong document type or missing data (confidence: ${pageConfidence}%)`
+      });
+
+      console.warn(`[OCR Worker] Marked as OCR_FAILED (wrong doc/missing data): ${captureId}`);
+      return; // falls through to finally → ackJob
+    }
+
+    // ── CASE 3: Normal successful extraction ──────────────────────────────────
     await prisma.capture.update({
       where: { id: captureId },
       data: { status: 'PENDING_REVIEW' }
     });
 
-    // Audit log
     await auditService.createAuditLog({
       captureId,
       eventType: 'OCR_COMPLETED',
@@ -240,12 +318,12 @@ const processJob = async (job) => {
       actorType: 'SYSTEM',
       fieldName: null,
       oldValue: null,
-      newValue: `${fields.length} fields extracted. Page confidence: ${Math.round(ocrResult.data.confidence)}%`
+      newValue: `${matchedCount}/${totalCount} fields extracted. Page confidence: ${pageConfidence}%`
     });
 
     console.log(
-      `[OCR Worker] Done: ${captureId} — ${fields.length} fields, ` +
-      `page confidence ${Math.round(ocrResult.data.confidence)}%`
+      `[OCR Worker] Done: ${captureId} — ${matchedCount}/${totalCount} fields, ` +
+      `page confidence ${pageConfidence}%`
     );
 
   } catch (error) {
@@ -265,6 +343,11 @@ const processJob = async (job) => {
       oldValue: null,
       newValue: error.message
     });
+
+  } finally {
+    // Always ack the job — this is what prevents the infinite loop
+    // Every exit path (early return, success, catch) hits this
+    await queueService.ackJob(job);
   }
 };
 
